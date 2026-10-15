@@ -1,0 +1,174 @@
+name: mini-nusu
+
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-demo123}
+      POSTGRES_DB: demo
+    volumes:
+      - mini-data:/var/lib/postgresql/data
+    configs:
+      - source: init_sql
+        target: /docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U demo -d demo"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    image: postgrest/postgrest:latest
+    environment:
+      PGRST_DB_URI: postgres://demo:${DB_PASSWORD:-demo123}@db:5432/demo
+      PGRST_DB_SCHEMAS: public
+      PGRST_DB_ANON_ROLE: web_anon
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: on-failure
+
+  web:
+    image: nginx:alpine
+    ports:
+      - "${WEB_PORT:-8090}:80"
+    depends_on:
+      - api
+    configs:
+      - source: nginx_conf
+        target: /etc/nginx/conf.d/default.conf
+      - source: index_html
+        target: /usr/share/nginx/html/index.html
+
+volumes:
+  mini-data:
+
+configs:
+  init_sql:
+    content: |
+      create table spaceships (
+        id serial primary key,
+        name text not null unique,
+        fuel int not null default 100
+      );
+      create table astronauts (
+        id serial primary key,
+        name text not null,
+        ship_id int references spaceships(id) on delete set null
+      );
+      create view stats as
+        select (select count(*) from spaceships) as ships,
+               (select count(*) from astronauts) as astronauts;
+      insert into spaceships (name, fuel) values ('Artemis I', 90), ('Ares Mars', 65), ('ISS Alpha', 100);
+      insert into astronauts (name, ship_id) values ('Nguyen Van An', 1), ('Tran Thi Binh', 2), ('Le Minh Cuong', null);
+      create role web_anon nologin;
+      grant usage on schema public to web_anon;
+      grant select, insert, update, delete on spaceships, astronauts to web_anon;
+      grant select on stats to web_anon;
+      grant usage, select on all sequences in schema public to web_anon;
+
+  nginx_conf:
+    content: |
+      server {
+        listen 80;
+        location / {
+          root /usr/share/nginx/html;
+          index index.html;
+        }
+        location /api/ {
+          proxy_pass http://api:3000/;
+        }
+      }
+
+  index_html:
+    content: |
+      <!doctype html>
+      <meta charset="utf-8">
+      <title>Mini NUSU</title>
+      <style>
+        body{font-family:system-ui;max-width:720px;margin:2rem auto;padding:0 1rem;background:#0b1020;color:#e6e9f5}
+        h1{margin-bottom:0}
+        .card{background:#151b33;padding:1rem;border-radius:10px;margin:1rem 0}
+        input,select,button{padding:.5rem;border-radius:6px;border:0;margin-right:.3rem}
+        button{background:#4f7cff;color:#fff;cursor:pointer}
+        li{margin:.4rem 0}
+        li button{background:#c0392b;padding:.2rem .5rem}
+      </style>
+      <h1>Mini NUSU</h1>
+      <p id="stats"></p>
+      <div class="card">
+        <h3>Tau vu tru</h3>
+        <ul id="ships"></ul>
+        <input id="sn" placeholder="Ten tau">
+        <input id="sf" type="number" value="100" style="width:80px">
+        <button onclick="run(addShip)">Them</button>
+      </div>
+      <div class="card">
+        <h3>Phi hanh gia</h3>
+        <ul id="astros"></ul>
+        <input id="an" placeholder="Ten">
+        <select id="as"></select>
+        <button onclick="run(addAstro)">Them</button>
+      </div>
+      <script>
+        async function j(p, o) {
+          var r = await fetch('/api' + p, o);
+          var t = await r.text();
+          if (!r.ok) throw new Error(t);
+          return t ? JSON.parse(t) : null;
+        }
+        function post(p, b) {
+          return j(p, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(b)});
+        }
+        function run(f) { f().catch(function (e) { alert(e.message); }); }
+        function del(p) { return j(p, {method: 'DELETE'}).then(load); }
+        function item(text, onDel) {
+          var e = document.createElement('li');
+          e.textContent = text + ' ';
+          var b = document.createElement('button');
+          b.textContent = 'Xoa';
+          b.onclick = function () { run(onDel); };
+          e.appendChild(b);
+          return e;
+        }
+        async function load() {
+          var s = (await j('/stats'))[0];
+          document.getElementById('stats').textContent = s.ships + ' tau, ' + s.astronauts + ' phi hanh gia';
+          var ships = await j('/spaceships?order=id');
+          var ul = document.getElementById('ships');
+          var sel = document.getElementById('as');
+          ul.innerHTML = '';
+          sel.innerHTML = '<option value="">Chua phan cong</option>';
+          ships.forEach(function (x) {
+            ul.appendChild(item(x.name + ' - nhien lieu ' + x.fuel + '%', function () { return del('/spaceships?id=eq.' + x.id); }));
+            var o = document.createElement('option');
+            o.value = x.id;
+            o.textContent = x.name;
+            sel.appendChild(o);
+          });
+          var as = await j('/astronauts?select=id,name,spaceships(name)&order=id');
+          var ua = document.getElementById('astros');
+          ua.innerHTML = '';
+          as.forEach(function (x) {
+            var ship = x.spaceships ? x.spaceships.name : 'chua phan cong';
+            ua.appendChild(item(x.name + ' (' + ship + ')', function () { return del('/astronauts?id=eq.' + x.id); }));
+          });
+        }
+        async function addShip() {
+          var n = document.getElementById('sn').value.trim();
+          if (!n) return;
+          await post('/spaceships', {name: n, fuel: +document.getElementById('sf').value});
+          document.getElementById('sn').value = '';
+          await load();
+        }
+        async function addAstro() {
+          var n = document.getElementById('an').value.trim();
+          if (!n) return;
+          var v = document.getElementById('as').value;
+          await post('/astronauts', {name: n, ship_id: v ? +v : null});
+          document.getElementById('an').value = '';
+          await load();
+        }
+        run(load);
+      </script>
